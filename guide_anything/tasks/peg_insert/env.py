@@ -26,7 +26,6 @@ class PegInsertEnv(DirectRLEnv):
     cfg: PegInsertEnvCfg
 
     def __init__(self, cfg: PegInsertEnvCfg, render_mode: str | None = None, **kwargs):
-        cfg.observation_space = 12 + (2 if cfg.reveal_world else 0)
         super().__init__(cfg, render_mode, **kwargs)
 
         self._hand_idx = self._robot.find_bodies("panda_hand")[0][0]
@@ -42,13 +41,19 @@ class PegInsertEnv(DirectRLEnv):
         self._hand_target_pos = torch.zeros(self.num_envs, 3, device=self.device)  # set every policy step
 
         self.latch = VirtualLatch(self.num_envs, self.cfg.latch, self.device)
-        self.actions = torch.zeros(self.num_envs, 3, device=self.device)
+        self.actions = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
         self.hole_pos_w = torch.zeros(self.num_envs, 3, device=self.device)  # center of the hole bottom
         self._hole_obs_noise = torch.zeros(self.num_envs, 3, device=self.device)
+        self.belief = torch.full((self.num_envs,), 0.5, device=self.device)  # P(LATCH) shown to the policy
+        self._potential = torch.zeros(self.num_envs, device=self.device)
+        self._last_step = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         # Outcome of each env's last finished episode, written just before it resets.
         self.final_world = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.final_belief = torch.zeros(self.num_envs, device=self.device)
         self.final_success = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.final_damaged = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.final_pressed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.final_tip_error = torch.zeros(self.num_envs, 3, device=self.device)  # tip minus goal, m
 
     # ------------------------------------------------------------------ scene
 
@@ -157,7 +162,12 @@ class PegInsertEnv(DirectRLEnv):
 
     def _pre_physics_step(self, actions: torch.Tensor):
         self.actions = actions.clamp(-1.0, 1.0)
-        tip_target = self.tip_pos_w + self.actions * self.cfg.control.action_scale
+        ctrl = self.cfg.control
+        offset = self.actions[:, :3] * ctrl.action_scale
+        safe_depth = -ctrl.safe_force / ctrl.stiffness[2]
+        pressing = (self.actions[:, 3] > 0) & (self.wrist_force_w[:, 2] > ctrl.commit_contact_force)
+        offset[:, 2] = torch.where(pressing, -ctrl.action_scale, offset[:, 2].clamp(min=safe_depth))
+        tip_target = self.tip_pos_w + offset
         self._hand_target_pos = tip_target - quat_apply(self._hand_quat, self._tip_offset)
 
     def _apply_action(self):
@@ -204,31 +214,54 @@ class PegInsertEnv(DirectRLEnv):
             self.tip_pos_w - hole_obs,
             self.tip_vel_w,
             self.wrist_force_w / 10.0,
-            self.actions,
+            self.actions[:, :3],  # motor part only, so the motor's inputs do not depend on the decision
+            self.belief.unsqueeze(-1),
+            (self.episode_length_buf / self.max_episode_length).unsqueeze(-1),
         ]
-        if self.cfg.reveal_world:
-            obs.append(torch.nn.functional.one_hot(self.latch.world, 2).float())
-        return {"policy": torch.cat(obs, dim=-1)}
+        # Privileged state for an asymmetric critic only. A broken FLOOR part looks like an intact one to
+        # the wrist sensor, so without this the critic cannot see a damaging press until the episode ends.
+        privileged = [
+            torch.nn.functional.one_hot(self.latch.world, 2).float(),
+            self.latch.damaged.float().unsqueeze(-1),
+            self.latch.released.float().unsqueeze(-1),
+        ]
+        return {"policy": torch.cat(obs, dim=-1), "critic": torch.cat(privileged, dim=-1)}
+
+    def _shaping_potential(self) -> torch.Tensor:
+        """Minus the distance to the hole axis at the latch plane. Zero anywhere on the axis below it."""
+        d = self.tip_pos_w - self.hole_pos_w
+        d[:, 2] = (d[:, 2] - self.cfg.geometry.latch_height).clamp(min=0.0)
+        return -self.cfg.reward.shaping * torch.linalg.vector_norm(d, dim=-1)
 
     def _get_rewards(self) -> torch.Tensor:
         r = self.cfg.reward
-        dist = torch.linalg.vector_norm(self.tip_pos_w - self.goal_pos_w, dim=-1)
-        reward = -r.distance * dist + r.success * self.success.float() - r.damage * self.latch.damaged.float()
-        self.extras["log"] = {
-            "success": self.success.float().mean(),
-            "damaged": self.latch.damaged.float().mean(),
-        }
-        return reward
+        last = self._last_step
+        # Potential-based shaping, with the potential of the terminal state taken as zero.
+        potential = torch.where(last, torch.zeros_like(self._potential), self._shaping_potential())
+        reward = r.gamma * potential - self._potential
+        self._potential = potential
+        outcome = r.success * self.success.float() - r.damage * self.latch.damaged.float()
+        return reward + torch.where(last, outcome, torch.zeros_like(outcome))
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        time_out = self.episode_length_buf >= self.max_episode_length - 1
-        terminated = self.latch.damaged.clone() if self.cfg.terminate_on_damage else torch.zeros_like(time_out)
-        return terminated, time_out
+        self.extras.pop("log", None)  # only present on steps where episodes end; see _reset_idx
+        # Every episode runs the full horizon and ends as a true termination: the outcome is paid on
+        # the last step, so the learner must not bootstrap past it.
+        self._last_step = self.episode_length_buf >= self.max_episode_length - 1
+        return self._last_step.clone(), torch.zeros_like(self._last_step)
 
     def _reset_idx(self, env_ids: torch.Tensor):
         self.final_world[env_ids] = self.latch.world[env_ids]
+        self.final_belief[env_ids] = self.belief[env_ids]
         self.final_success[env_ids] = self.success[env_ids]
         self.final_damaged[env_ids] = self.latch.damaged[env_ids]
+        self.final_pressed[env_ids] = self.latch.pressed[env_ids]
+        self.final_tip_error[env_ids] = (self.tip_pos_w - self.goal_pos_w)[env_ids]
+        self.extras["log"] = {
+            "success": self.final_success[env_ids].float().mean(),
+            "damaged": self.final_damaged[env_ids].float().mean(),
+            "pressed": self.final_pressed[env_ids].float().mean(),
+        }
         super()._reset_idx(env_ids)
         n = len(env_ids)
 
@@ -252,6 +285,23 @@ class PegInsertEnv(DirectRLEnv):
         self._hole_obs_noise[env_ids] = sample_uniform(-obs_noise, obs_noise, (n, 3), self.device)
         self._hole_obs_noise[env_ids, 2] = 0.0
 
-        is_latch = torch.rand(n, device=self.device) < self.cfg.p_latch
-        self.latch.reset(env_ids, torch.where(is_latch, LATCH, FLOOR))
+        belief, world = self._sample_belief_and_world(n)
+        self.belief[env_ids] = belief
+        self.latch.reset(env_ids, world)
         self.actions[env_ids] = 0.0
+        self._potential[env_ids] = self._shaping_potential()[env_ids]
+
+    def _sample_belief_and_world(self, n: int) -> tuple[torch.Tensor, torch.Tensor]:
+        mode = self.cfg.belief.mode
+        if mode == "calibrated":
+            belief = torch.rand(n, device=self.device)
+            is_latch = torch.rand(n, device=self.device) < belief
+        elif mode == "oracle":
+            is_latch = torch.rand(n, device=self.device) < 0.5
+            belief = is_latch.float()
+        elif mode == "prior":
+            belief = torch.full((n,), 0.5, device=self.device)
+            is_latch = torch.rand(n, device=self.device) < 0.5
+        else:
+            raise ValueError(f"unknown belief mode {mode}")
+        return belief, torch.where(is_latch, LATCH, FLOOR)

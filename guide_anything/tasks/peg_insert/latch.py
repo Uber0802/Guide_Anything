@@ -44,12 +44,19 @@ class VirtualLatch:
         self.released = torch.zeros(num_envs, dtype=torch.bool, device=device)
         self.damaged = torch.zeros(num_envs, dtype=torch.bool, device=device)
         self.force = torch.zeros(num_envs, device=device)
+        self.peak_force = torch.zeros(num_envs, device=device)  # largest resisting force this episode
+
+    @property
+    def pressed(self) -> torch.Tensor:
+        """Pushed past the damage force: the irreversible commitment, whichever the world."""
+        return self.peak_force > self.params.damage_force
 
     def reset(self, env_ids: torch.Tensor, world: torch.Tensor):
         self.world[env_ids] = world
         self.released[env_ids] = False
         self.damaged[env_ids] = False
         self.force[env_ids] = 0.0
+        self.peak_force[env_ids] = 0.0
 
     def step(self, penetration: torch.Tensor, down_speed: torch.Tensor) -> torch.Tensor:
         """Advance one physics step and return the upward force on the peg.
@@ -62,6 +69,7 @@ class VirtualLatch:
         engaged = (penetration > 0.0) & ~self.released
         force = p.stiffness * penetration.clamp(min=0.0) + p.damping * down_speed.clamp(min=0.0)
         force = torch.where(engaged, force, torch.zeros_like(force))
+        self.peak_force = torch.maximum(self.peak_force, force)
 
         is_floor = self.world == FLOOR
         self.damaged |= is_floor & (force > p.damage_force)

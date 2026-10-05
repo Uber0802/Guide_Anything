@@ -41,6 +41,11 @@ class ControlCfg:
     rot_stiffness: tuple[float, float, float] = (20.0, 20.0, 5.0)
     damping_ratio: float = 1.0
     action_scale: float = 0.05  # m, max offset of the target from the current tip per policy step
+    # Without commitment the downward offset is clamped so the commanded force stays below this, under
+    # the damage force. Committing (action[3] > 0) is a guarded move: once the wrist reads more than
+    # commit_contact_force upward, it presses down with the full stiffness * action_scale.
+    safe_force: float = 8.0  # N
+    commit_contact_force: float = 0.3  # N
     nullspace_stiffness: float = 10.0
 
 
@@ -53,17 +58,41 @@ class ResetCfg:
 
 @configclass
 class RewardCfg:
-    distance: float = 10.0  # per m of tip-to-goal distance
-    success: float = 1.0  # per step while seated
-    damage: float = 10.0  # once, on the step the part breaks
+    """Outcome on the last step, plus potential-based shaping toward the hole entrance.
+
+    Every episode runs the full horizon and the outcome is paid only on its last
+    step, so discounting scales all outcomes alike and the optimal decision is
+    to press iff p > (success + damage) / (2 * success + damage), 0.8 for L = 3.
+    """
+
+    success: float = 1.0
+    damage: float = 3.0  # L, the stakes
+    shaping: float = 10.0  # per m of distance to the hole axis at the latch plane
+    gamma: float = 0.99  # must equal the learner's discount for the shaping to leave the optimum unchanged
+
+
+@configclass
+class BeliefCfg:
+    """How the belief p = P(LATCH) shown to the policy is generated at reset.
+
+    calibrated: p ~ U(0, 1) and the world is drawn with P(LATCH) = p. This is the joint law of a
+        50/50 world and a message whose accuracy is uniform on [0.5, 1].
+    oracle: p is 1 in LATCH and 0 in FLOOR.
+    prior: p = 0.5 and the world is a fair coin. Nothing about the world is revealed.
+    """
+
+    mode: str = "calibrated"
 
 
 @configclass
 class PegInsertEnvCfg(DirectRLEnvCfg):
     decimation: int = 8
     episode_length_s: float = 10.0
-    action_space: int = 3
-    observation_space: int = 12  # the env adds 2 when reveal_world is set
+    # tip offset (3), commit (1): when > 0 and in contact, press down at full force instead of the z offset
+    action_space: int = 4
+    # tip minus hole (3), tip velocity (3), wrist force / 10 (3), previous tip offset action (3), belief (1),
+    # time (1)
+    observation_space: int = 14
     state_space: int = 0
 
     sim: SimulationCfg = SimulationCfg(
@@ -119,14 +148,8 @@ class PegInsertEnvCfg(DirectRLEnvCfg):
     control: ControlCfg = ControlCfg()
     reset: ResetCfg = ResetCfg()
     reward: RewardCfg = RewardCfg()
+    belief: BeliefCfg = BeliefCfg()
     latch: LatchParams = LatchParams()
-
-    # Probability of the LATCH world at reset. The FLOOR world has the complement.
-    p_latch: float = 0.5
-    # Append the one-hot world to the observation (oracle belief for motor checks).
-    reveal_world: bool = False
-    # End the episode when the part breaks. Diagnostics turn this off to see the force keep rising.
-    terminate_on_damage: bool = True
 
     success_xy_tol: float = 0.0025
     success_depth_tol: float = 0.002

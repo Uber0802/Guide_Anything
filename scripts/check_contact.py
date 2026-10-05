@@ -37,7 +37,6 @@ cfg = PegInsertEnvCfg()
 cfg.scene.num_envs = 2
 cfg.reset.tip_xy_noise = 0.0
 cfg.episode_length_s = 1e3  # never time out inside this script
-cfg.terminate_on_damage = False  # keep pressing the FLOOR part after it breaks
 env = PegInsertEnv(cfg)
 env.reset()
 ids = torch.arange(2, device=env.device)

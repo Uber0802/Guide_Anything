@@ -6,6 +6,8 @@ layer can do (oracle) and generate pre-commit histories (blind press).
 The controller is an impedance around ``tip + action * action_scale``. In free
 space an action moves the tip by roughly that offset per step; in contact it
 commands a force of ``stiffness_z * action_scale * action`` into the surface.
+The fourth action commits to pressing at full force; these controllers commit
+exactly when they ask for more than the safe force.
 """
 
 from __future__ import annotations
@@ -14,6 +16,10 @@ import torch
 
 from .tasks.peg_insert.env import PegInsertEnv
 from .tasks.peg_insert.latch import FLOOR
+
+# Commit value when not pressing. Any negative value means "no"; this one sits a few policy
+# standard deviations from zero so a warm-started policy still explores pressing now and then.
+NO_COMMIT = -0.55
 
 
 class ScriptedController:
@@ -54,22 +60,29 @@ class ScriptedController:
         action[:, 2] = torch.where(above_socket | centered, -step / self.scale, torch.zeros_like(step))
         return action
 
+    def _press(self, action: torch.Tensor, force: torch.Tensor | float) -> torch.Tensor:
+        """In contact, replace the z action by a force command and commit iff it exceeds the safe force."""
+        force = torch.as_tensor(force, device=action.device).expand(action.shape[0])
+        contact = self._in_contact()
+        action[:, 2] = torch.where(contact, -force / self.newton_per_action, action[:, 2])
+        commit = torch.where(contact & (force > self.env.cfg.control.safe_force), 1.0, NO_COMMIT)
+        return torch.cat([action, commit.unsqueeze(-1)], dim=-1).clamp(-1, 1)
+
     def _in_contact(self) -> torch.Tensor:
         return self.env.wrist_force_w[:, 2] > self.contact_force
 
     def oracle(self, hold_force: float = 4.0, release_force: float = 18.0) -> torch.Tensor:
         """Knows the world: push through a latch, rest gently on a floor."""
-        action = self._approach()
-        floor = self.env.latch.world == FLOOR
-        force = torch.where(floor, hold_force, release_force)
-        action[:, 2] = torch.where(self._in_contact(), -force / self.newton_per_action, action[:, 2])
-        return action.clamp(-1, 1)
+        force = torch.where(self.env.latch.world == FLOOR, hold_force, release_force)
+        return self._press(self._approach(), force)
+
+    def by_belief(self, threshold: float, hold_force: float = 4.0, release_force: float = 18.0) -> torch.Tensor:
+        """Oracle motor, but the decision comes from the belief: press through iff p > threshold."""
+        force = torch.where(self.env.belief > threshold, release_force, hold_force)
+        return self._press(self._approach(), force)
 
     def blind_press(self, stop_force: float, ramp: float = 0.5) -> torch.Tensor:
         """Does not know the world: on contact, ramp the commanded force by ``ramp`` N/step up to ``stop_force``."""
-        action = self._approach()
-        contact = self._in_contact()
         ramped = (self._press_force + ramp).clamp(max=stop_force)
-        self._press_force = torch.where(contact, ramped, torch.full_like(ramped, self.contact_force))
-        action[:, 2] = torch.where(contact, -self._press_force / self.newton_per_action, action[:, 2])
-        return action.clamp(-1, 1)
+        self._press_force = torch.where(self._in_contact(), ramped, torch.full_like(ramped, self.contact_force))
+        return self._press(self._approach(), self._press_force)

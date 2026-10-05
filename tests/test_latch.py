@@ -69,3 +69,12 @@ def test_reset_clears_state():
 def test_params_must_alias():
     with pytest.raises(ValueError):
         LatchParams(release_force=10.0, damage_force=12.0)
+
+
+def test_pressed_tracks_peak_force_in_both_worlds():
+    latch = make([LATCH, FLOOR])
+    k = latch.params.stiffness
+    press(latch, [5.0 / k, 0.0])
+    assert latch.pressed.tolist() == [False, False]
+    press(latch, [12.0 / k])
+    assert latch.pressed.tolist() == [True, True]

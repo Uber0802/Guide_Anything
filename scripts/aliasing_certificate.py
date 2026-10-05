@@ -39,7 +39,7 @@ cfg = PegInsertEnvCfg()
 cfg.scene.num_envs = args.episodes
 cfg.seed = args.seed
 cfg.episode_length_s = 1e3  # one episode per env, never time out
-cfg.terminate_on_damage = False  # damage is checked explicitly below
+cfg.belief.mode = "prior"  # the policy observation must carry nothing about the world
 env = PegInsertEnv(cfg)
 ctrl = ScriptedController(env)
 worlds = (torch.arange(args.episodes, device=env.device) >= args.episodes // 2).long()  # 0 = LATCH, 1 = FLOOR
