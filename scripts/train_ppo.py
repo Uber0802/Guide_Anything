@@ -19,7 +19,7 @@ parser.add_argument(
     "--warm_std",
     type=float,
     nargs=4,
-    default=[0.005, 0.005, 0.02, 0.1],
+    default=[0.005, 0.005, 0.02, 0.3],
     help="action std after warm start: x, y, z, commit. 0.005 in x or y is 0.25 mm; 0.02 in z is 0.4 N",
 )
 parser.add_argument("--gamma", type=float, default=0.99, help="also the shaping discount")
@@ -29,6 +29,9 @@ parser.add_argument("--lr", type=float, default=1e-3)
 parser.add_argument("--desired_kl", type=float, default=0.01)
 parser.add_argument("--schedule", default="adaptive", choices=["adaptive", "fixed"])
 parser.add_argument("--warm_start_rounds", type=int, default=0, help="DAgger rounds imitating a never-press teacher")
+parser.add_argument(
+    "--warm_press_fraction", type=float, default=0.5, help="warm-start episodes executed with commit forced on"
+)
 parser.add_argument("--freeze_motor", action="store_true", help="after warm start, train only the commit output")
 parser.add_argument("--tag", default="")
 parser.add_argument("--log_root", type=Path, default=Path("logs/ppo"))
@@ -72,6 +75,8 @@ if args.warm_start_rounds:
         gamma=args.gamma,
         rounds=args.warm_start_rounds,
         action_std=args.warm_std,
+        commit_dim=3,
+        press_fraction=args.warm_press_fraction,
     )
     env.reset()
 if args.freeze_motor:

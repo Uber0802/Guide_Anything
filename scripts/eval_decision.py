@@ -6,6 +6,7 @@ value), the outcome return, and its gap to the Bayes decision with a perfect mot
 
     python scripts/eval_decision.py --headless --checkpoint logs/ppo/<run>/model_299.pt [--stochastic]
     python scripts/eval_decision.py --headless --scripted 0.8
+    python scripts/eval_decision.py --headless --decision_q logs/decision_q/decision_q_s0.pt
 """
 
 import argparse
@@ -17,6 +18,7 @@ parser = argparse.ArgumentParser()
 source = parser.add_mutually_exclusive_group(required=True)
 source.add_argument("--checkpoint", type=Path)
 source.add_argument("--scripted", type=float, nargs="+", help="belief thresholds for the scripted controller")
+source.add_argument("--decision_q", type=Path, help="DecisionQ weights; scripted motor, commit from Q")
 parser.add_argument("--num_envs", type=int, default=4096)
 parser.add_argument("--seed", type=int, default=1000)
 parser.add_argument("--tol", type=float, default=0.05)
@@ -108,6 +110,21 @@ if args.checkpoint:
     mode = "sampled" if args.stochastic else "mean"
     with torch.inference_mode():
         t = report(f"PPO ({mode} actions) {args.checkpoint}", run_episodes(lambda obs: act(wrapped._wrap(obs))))
+    print(f"\n1.2 {'PASS' if abs(t - analytic) <= args.tol else 'FAIL'}: |{t:.3f} - {analytic:.3f}| <= {args.tol}")
+elif args.decision_q:
+    from guide_anything.rl.decision_q import DecisionQ
+
+    q = DecisionQ(cfg.observation_space).to(env.device)
+    q.load_state_dict(torch.load(args.decision_q, map_location=env.device))
+    ctrl = ScriptedController(env)
+
+    def act(obs):
+        action = ctrl.by_belief(threshold=float("inf"))
+        action[:, 3] = torch.where(q.press(obs["policy"]), 1.0, -1.0)
+        return action
+
+    with torch.no_grad():
+        t = report(f"DecisionQ {args.decision_q}", run_episodes(act))
     print(f"\n1.2 {'PASS' if abs(t - analytic) <= args.tol else 'FAIL'}: |{t:.3f} - {analytic:.3f}| <= {args.tol}")
 else:
     ctrl = ScriptedController(env)

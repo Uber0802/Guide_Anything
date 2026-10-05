@@ -34,6 +34,7 @@ guide_anything/
     rsl.py                   rsl_rl VecEnv adapter and PPO config
     warm_start.py            DAgger warm start from a scripted teacher
     split.py                 freeze the motor outputs and normalizer, train only the commit output
+    decision_q.py            Q-learner for the one-shot decision
   tasks/peg_insert/
     latch.py                 virtual latch, pure torch
     env_cfg.py               geometry, control, reset, reward, latch parameters
@@ -45,20 +46,24 @@ scripts/
   aliasing_certificate.py    can a classifier tell the worlds apart before the part breaks?
   train_ppo.py               belief-conditioned PPO, optional warm start and motor freeze
   eval_decision.py           press threshold, return, per-belief table for a policy or scripted reference
-  run_1_2.sh                 checklist 1.2: five seeds, train then evaluate
-tests/                       latch and classifier unit tests
+  run_1_2.sh                 checklist 1.2, PPO arm: five seeds, train then evaluate
+  train_decision_q.py        Q-learner for the one-shot press-or-stop decision
+  run_1_2_q.sh               checklist 1.2, Q-learner arm
+tests/                       latch, classifier and decision unit tests
+EXPERIMENTS.md               experiment log (Chinese), in order, failures included
 ```
 
 ## Environment
 
 - Franka Panda, square 8 mm peg rigidly attached to the hand, socket from four
-  kinematic walls, 0.5 mm clearance, 25 mm deep. The ground is the hole bottom.
+  kinematic walls, 1 mm clearance, 25 mm deep. The ground is the hole bottom.
 - Wrist F/T is the incoming joint wrench of the hand link, rotated to world,
   sign flipped to "force the environment exerts on the tool".
 - Action (4): 3-D offset of the tip target from the current tip, scaled by
   5 cm, plus a commit. Without commit the downward offset is clamped so the
-  commanded force stays under 8 N. Commit > 0 is a guarded move: once the wrist
-  reads contact it presses with the full `400 N/m * 0.05 m` = 20 N.
+  commanded force stays under 8 N. The commit is read once, when the wrist
+  first reads contact; if set, the arm then presses with the full
+  `400 N/m * 0.05 m` = 20 N.
   Orientation is held pointing down.
 - Observation (14): tip minus observed hole, tip velocity, wrist force / 10,
   previous tip-offset action, belief p = P(LATCH), episode time. A separate
@@ -85,8 +90,7 @@ tests/                       latch and classifier unit tests
 | FLOOR breaks / LATCH releases | 10.4 N / 15.0 N |
 | Oracle success, z revealed (2048 episodes) | LATCH 1.000, FLOOR 1.000, no damage |
 | Throughput, oracle controller | 1.7k / 6.6k / 22.8k env steps/s at 256 / 1024 / 4096 envs |
-| Aliasing certificate, blind press held at 8 N, 2500 episodes, held-out 1250 | logistic 0.516, MLP 0.502 (chance s.e. 0.014): PASS |
-| Same, 5 train/test splits | logistic mean 0.497 (0.475 to 0.517), MLP mean 0.497 (0.483 to 0.518) |
+| Aliasing certificate, blind press held at 8 N, 2500 episodes, held-out 1250 | logistic 0.503, MLP 0.494 (chance s.e. 0.014): PASS |
 | Positive control, same pipeline pressed to 18 N | logistic 1.000, MLP 1.000 |
 
 The certificate only covers the histories it saw: blind press, ramp 0.5 N per
@@ -94,44 +98,19 @@ step, hold at 8 N. Below 15 N the two worlds share one force law, so other
 safe probes should not separate them either, but that is by construction, not
 measured.
 
-The certificate was measured before the commit action and the belief and time
-observations were added; the contact physics it tests is unchanged.
-
 ## Checklist 1.2: does the learner find the press threshold?
 
-Scripted reference with an oracle motor, press iff p > 0.8: threshold 0.800,
-return 0.606 (Bayes with a perfect motor 0.600, always stop 0.50).
+Optimal: press iff p > 0.8 (Bayes return 0.60 with a perfect motor; scripted
+reference 0.606). Five seeds each, pass = at least 4 within 0.05.
 
-PPO from scratch failed in four settings (noise 1.0 or 0.3, gamma 0.99 or
-0.998): it either pressed everything or stopped short of the latch. What it
-took to get a learned decision:
-
-1. The commit action and 8 N safe clamp, so exploration noise in contact does
-   not break the part by accident.
-2. DAgger warm start from a teacher that never presses (motor only, no decision).
-3. Freezing the motor outputs and the actor's observation normalizer after
-   warm start; PPO gradients otherwise destroy the 0.25 mm insertion.
-4. Previous commit removed from the observation, so the frozen motor's inputs
-   do not move with the decision.
-5. Asymmetric critic: a damaged FLOOR part is invisible to the wrist, so
-   without privileged flags PPO credits pressing for LATCH successes only.
-6. Entropy bonus 0.01 (it acts on the commit std only; the motor std is frozen).
-
-Result, five seeds, 1024 envs, 300 iterations (`scripts/run_1_2.sh`):
-
-| Seed | Threshold, sampled actions | Return | Threshold, mean action |
+| Learner | Thresholds | Returns | Pass |
 |---|---|---|---|
-| 0 | 0.803 | 0.494 | 1.000 |
-| 1 | 1.000 | 0.500 | 1.000 |
-| 2 | 0.814 | 0.557 | 1.000 |
-| 3 | 0.782 | 0.573 | 0.995 |
-| 4 | 0.793 | 0.468 | 1.000 |
+| PPO, warm-started motor frozen, commit latched at first contact (`run_1_2.sh`) | 0.812, 0.788, 0.941, 0.810, 0.773 | 0.543 to 0.597 | 4/5 |
+| Q-learner over the one-shot decision (`run_1_2_q.sh`) | 0.819, 0.802, 0.788, 0.795, 0.772 | 0.597 to 0.606 | 5/5 |
 
-4 of 5 seeds are within 0.05 of 0.8 with sampled actions. The decision lives
-in the per-step commit probability: the mean commit never crosses zero, so the
-deterministic policy never presses. Returns are low for seeds 0 and 4 because
-the frozen motor never saw post-release states during warm start; it often
-fails to finish the insertion after a correct press.
+The Q-learner uses about a tenth of the samples. PPO from scratch failed in
+every setting tried; see `EXPERIMENTS.md` for the full sequence of failures
+and the fixes they led to.
 
-Not done yet: warm start that covers post-commit states, observation noise on
-the wrist force.
+Not done yet: 1.3 with a probe action, 2.0 identification curves, 2.1 oracle
+gap, V-force, observation noise on the wrist force.

@@ -47,6 +47,8 @@ class PegInsertEnv(DirectRLEnv):
         self.belief = torch.full((self.num_envs,), 0.5, device=self.device)  # P(LATCH) shown to the policy
         self._potential = torch.zeros(self.num_envs, device=self.device)
         self._last_step = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._decided = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._commit = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         # Outcome of each env's last finished episode, written just before it resets.
         self.final_world = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.final_belief = torch.zeros(self.num_envs, device=self.device)
@@ -165,7 +167,13 @@ class PegInsertEnv(DirectRLEnv):
         ctrl = self.cfg.control
         offset = self.actions[:, :3] * ctrl.action_scale
         safe_depth = -ctrl.safe_force / ctrl.stiffness[2]
-        pressing = (self.actions[:, 3] > 0) & (self.wrist_force_w[:, 2] > ctrl.commit_contact_force)
+        # The commit is read once, at the first contact, and then held: pressing through is one
+        # irreversible decision per episode, not a coin flipped at every step of contact.
+        contact = self.wrist_force_w[:, 2] > ctrl.commit_contact_force
+        first_contact = contact & ~self._decided
+        self._commit = torch.where(first_contact, self.actions[:, 3] > 0, self._commit)
+        self._decided |= contact
+        pressing = self._commit & contact
         offset[:, 2] = torch.where(pressing, -ctrl.action_scale, offset[:, 2].clamp(min=safe_depth))
         tip_target = self.tip_pos_w + offset
         self._hand_target_pos = tip_target - quat_apply(self._hand_quat, self._tip_offset)
@@ -289,6 +297,8 @@ class PegInsertEnv(DirectRLEnv):
         self.belief[env_ids] = belief
         self.latch.reset(env_ids, world)
         self.actions[env_ids] = 0.0
+        self._decided[env_ids] = False
+        self._commit[env_ids] = False
         self._potential[env_ids] = self._shaping_potential()[env_ids]
 
     def _sample_belief_and_world(self, n: int) -> tuple[torch.Tensor, torch.Tensor]:

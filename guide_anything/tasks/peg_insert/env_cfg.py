@@ -23,7 +23,7 @@ class GeometryCfg:
     peg_size: float = 0.008  # side of the square peg, m
     peg_length: float = 0.06
     peg_tip_offset: float = 0.15  # hand frame origin to peg tip, along the hand z axis
-    clearance: float = 0.0005  # hole side minus peg side
+    clearance: float = 0.001  # hole side minus peg side; generous, the study is about the decision, not precision
     hole_depth: float = 0.025
     socket_width: float = 0.05  # outer side of the socket block
     socket_pos: tuple[float, float] = (0.55, 0.0)  # in the env frame, on the ground
@@ -42,8 +42,8 @@ class ControlCfg:
     damping_ratio: float = 1.0
     action_scale: float = 0.05  # m, max offset of the target from the current tip per policy step
     # Without commitment the downward offset is clamped so the commanded force stays below this, under
-    # the damage force. Committing (action[3] > 0) is a guarded move: once the wrist reads more than
-    # commit_contact_force upward, it presses down with the full stiffness * action_scale.
+    # the damage force. The commit (action[3] > 0) is read once, when the wrist first reads more than
+    # commit_contact_force upward; if set, the arm then presses with the full stiffness * action_scale.
     safe_force: float = 8.0  # N
     commit_contact_force: float = 0.3  # N
     nullspace_stiffness: float = 10.0
@@ -88,7 +88,7 @@ class BeliefCfg:
 class PegInsertEnvCfg(DirectRLEnvCfg):
     decimation: int = 8
     episode_length_s: float = 10.0
-    # tip offset (3), commit (1): when > 0 and in contact, press down at full force instead of the z offset
+    # tip offset (3), commit (1): read at first contact; if > 0, press down at full force from then on
     action_space: int = 4
     # tip minus hole (3), tip velocity (3), wrist force / 10 (3), previous tip offset action (3), belief (1),
     # time (1)

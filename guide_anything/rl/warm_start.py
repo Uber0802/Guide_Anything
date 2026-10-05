@@ -2,6 +2,9 @@
 
 The teacher only supplies motor skill. Round 0 rolls out the teacher; later
 rounds roll out the student and label its states with the teacher's action.
+To cover the states after a press without teaching when to press, a random
+fraction of episodes executes commit = +1 regardless of the policy, while the
+commit label stays the teacher's.
 The actor is regressed onto the aggregated labels and the critic onto the
 discounted returns of the latest student rollout, so PPO starts from a policy
 whose value estimate already matches it.
@@ -17,14 +20,25 @@ from rsl_rl.modules import ActorCritic
 from .rsl import RslRlEnv
 
 
-def _rollout(env: RslRlEnv, policy: ActorCritic, teacher: Callable[[], torch.Tensor], student_acts: bool, gamma: float):
+def _rollout(
+    env: RslRlEnv,
+    policy: ActorCritic,
+    teacher: Callable[[], torch.Tensor],
+    student_acts: bool,
+    gamma: float,
+    commit_dim: int | None,
+    press_fraction: float,
+):
     obs = env.reset()
+    forced = torch.rand(env.num_envs, device=env.device) < press_fraction
     observations, critic_observations, labels, rewards = [], [], [], []
     while True:
         policy.update_normalization(obs)
         target = teacher()
         with torch.no_grad():
-            action = policy.act_inference(obs) if student_acts else target
+            action = policy.act_inference(obs) if student_acts else target.clone()
+        if commit_dim is not None:
+            action[forced, commit_dim] = 1.0
         observations.append(policy.get_actor_obs(obs).clone())
         critic_observations.append(policy.get_critic_obs(obs).clone())
         labels.append(target.clone())
@@ -67,10 +81,14 @@ def warm_start(
     rounds: int = 4,
     epochs: int = 3,
     action_std: float | list[float] = 0.2,
+    commit_dim: int | None = None,
+    press_fraction: float = 0.0,
 ):
     data_x, data_y = [], []
     for r in range(rounds):
-        x, x_critic, y, returns, episode_return = _rollout(env, policy, teacher, student_acts=r > 0, gamma=gamma)
+        x, x_critic, y, returns, episode_return = _rollout(
+            env, policy, teacher, r > 0, gamma, commit_dim, press_fraction
+        )
         data_x.append(x)
         data_y.append(y)
         actor_loss = _regress(policy.actor, policy.actor_obs_normalizer, torch.cat(data_x), torch.cat(data_y), epochs)
